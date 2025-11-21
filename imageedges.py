@@ -27,7 +27,7 @@ st.markdown(
 )
 
 st.title("⚙️ Metal Spike Lab")
-st.caption("Colored chrome edges + spikes + warps + glitches + background tricks + extra FX (auto-pop).")
+st.caption("Thin chrome edges + long thorny spikes + warps + glitches + background tricks (auto-pop).")
 
 # ───────────────────────────────────────────────────────────────
 # Helpers
@@ -68,7 +68,7 @@ def apply_bg_filter(img_rgb: np.ndarray, mode: str) -> np.ndarray:
 
 
 # ───────────────────────────────────────────────────────────────
-# Edge extraction
+# Edge extraction (always thin)
 # ───────────────────────────────────────────────────────────────
 def filter_small_edges(edges: np.ndarray, min_edge_area: int) -> np.ndarray:
     """
@@ -93,16 +93,15 @@ def filter_small_edges(edges: np.ndarray, min_edge_area: int) -> np.ndarray:
     return filtered
 
 
-def extract_edges_bold(
+def extract_edges_thin(
     img_bgr: np.ndarray,
     low_thresh: int,
     high_thresh: int,
-    thickness: float,
     pre_blur_sigma: float,
     min_edge_area: int
 ) -> np.ndarray:
     """
-    Canny edges + optional pre-blur + area filtering + dilation.
+    Thin Canny edges (no dilation). Always stays ~1px-ish.
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -111,20 +110,13 @@ def extract_edges_bold(
 
     edges = cv2.Canny(gray, low_thresh, high_thresh)
     edges = filter_small_edges(edges, min_edge_area=min_edge_area)
-
-    thickness_int = max(1, int(thickness))
-    if thickness_int > 1:
-        kernel_size = 2 * thickness_int + 1
-        kernel = np.ones((kernel_size, kernel_size), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=1)
-
     return edges
 
 
 # ───────────────────────────────────────────────────────────────
-# Crystal spikes (thorny field, random directions)
+# Thorny spikes (long, random, protruding)
 # ───────────────────────────────────────────────────────────────
-def crystal_spike_field_shift_random(
+def crystal_spike_field_thorny(
     edges_f: np.ndarray,
     spike_length: float,
     decay: float,
@@ -133,16 +125,21 @@ def crystal_spike_field_shift_random(
 ) -> np.ndarray:
     """
     Thorny spikes via directional shifting with randomness.
-    edges_f: float 0–1
+    edges_f: float 0–1, thin edges map.
+
+    Compared to previous version, this one:
+    - favors longer rays
+    - shapes them via power + threshold to look like thorns
     """
     if spike_length <= 0:
         return np.zeros_like(edges_f, dtype=np.float32)
 
     h, w = edges_f.shape
-    L = max(1, int(spike_length))
+    L = max(5, int(spike_length))  # enforce at least some length
     decay = float(np.clip(decay, 0.01, 0.99))
     randomness = float(np.clip(randomness, 0.0, 1.0))
 
+    # Base cardinal + diagonal directions
     base_dirs = [
         (1, 0), (-1, 0), (0, 1), (0, -1),
         (1, 1), (-1, -1), (1, -1), (-1, 1),
@@ -150,7 +147,8 @@ def crystal_spike_field_shift_random(
 
     rng = np.random.default_rng(seed)
 
-    max_extra_dirs = 32
+    # Many extra random ray directions → more bramble-ish
+    max_extra_dirs = 48
     extra_count = int(round(randomness * max_extra_dirs))
     extra_dirs = []
     for _ in range(extra_count):
@@ -170,8 +168,9 @@ def crystal_spike_field_shift_random(
             sx = step * dx
             sy = step * dy
 
+            # Jitter the path a bit to avoid perfect straight beams
             if randomness > 0:
-                jitter_amp = 3
+                jitter_amp = 4
                 jx = rng.integers(-jitter_amp, jitter_amp + 1)
                 jy = rng.integers(-jitter_amp, jitter_amp + 1)
                 sx += int(jx * randomness)
@@ -184,11 +183,15 @@ def crystal_spike_field_shift_random(
             acc = np.maximum(acc, shifted * weight)
         spike = np.maximum(spike, acc)
 
+    # Normalize
     max_val = spike.max()
     if max_val > 1e-6:
         spike = spike / max_val
 
-    spike = cv2.GaussianBlur(spike, (0, 0), 0.8)
+    # Shape into thorns: enhance bright ridges, kill low noise
+    spike = np.power(spike, 1.5)       # emphasize strong rays
+    spike[spike < 0.25] = 0.0          # cut weak haze
+    spike = cv2.GaussianBlur(spike, (0, 0), 0.6)
     return np.clip(spike, 0.0, 1.0)
 
 
@@ -215,7 +218,7 @@ def chrome_shading_from_edges(
     seed: int
 ) -> (np.ndarray, np.ndarray):
     """
-    Build a metal look from edges with arbitrary edge color and spikes.
+    Build a metal look from thin edges with thorny spikes.
     Auto-contrast so it always "pops".
     """
     edges_f = edges.astype(np.float32) / 255.0
@@ -249,7 +252,8 @@ def chrome_shading_from_edges(
 
     spec = np.power(np.clip(diffuse, 0.0, 1.0), shininess) * specular_strength
 
-    spikes = crystal_spike_field_shift_random(
+    # Thorny spikes from thin edges
+    spikes = crystal_spike_field_thorny(
         edges_f,
         spike_length=spike_length,
         decay=spike_decay,
@@ -257,6 +261,7 @@ def chrome_shading_from_edges(
         seed=seed + 123
     )
 
+    # Optional thickness growth (kept subtle, default small)
     if spike_thickness > 0:
         k = max(1, int(spike_thickness))
         ksize = 2 * k + 1
@@ -299,7 +304,7 @@ def chrome_shading_from_edges(
     color = np.clip(color_f, 0, 255).astype(np.uint8)
 
     # Mask background using edges + spikes
-    mask = np.clip(edges_f + spikes * 0.7, 0.0, 1.0)
+    mask = np.clip(edges_f * 1.2 + spikes * 0.9, 0.0, 1.0)
     mask = cv2.GaussianBlur(mask, (0, 0), 1.5)
     mask = np.expand_dims(mask, axis=2)
     metal_dark_bg = (color.astype(np.float32) * mask).astype(np.uint8)
@@ -533,7 +538,6 @@ def process_image(
     img_bgr: np.ndarray,
     low_thresh: int,
     high_thresh: int,
-    thickness: float,
     pre_blur_sigma: float,
     min_edge_area: int,
     metal_depth: float,
@@ -566,11 +570,10 @@ def process_image(
     Full pipeline -> final artwork + edges + spike mask.
     Returns: (BGR image, edges, spikes)
     """
-    edges = extract_edges_bold(
+    edges = extract_edges_thin(
         img_bgr,
         low_thresh=low_thresh,
         high_thresh=high_thresh,
-        thickness=thickness,
         pre_blur_sigma=pre_blur_sigma,
         min_edge_area=min_edge_area
     )
@@ -625,10 +628,9 @@ uploaded_file = st.file_uploader(
 )
 
 with st.sidebar:
-    st.header("🧵 Edge")
+    st.header("🧵 Edge (thin core)")
     low_thresh = st.slider("Canny low threshold", 0, 255, 70)
     high_thresh = st.slider("Canny high threshold", 0, 255, 160)
-    thickness = st.slider("Core edge thickness (px)", 1, 50, 4)
     pre_blur_sigma = st.slider("Detail smoothing (pre-blur)", 0.0, 10.0, 1.0, step=0.1)
     min_edge_area = st.slider("Min edge area (px)", 0, 10000, 200, step=50)
 
@@ -648,12 +650,12 @@ with st.sidebar:
     brightness = st.slider("Brightness", 0.5, 2.0, 1.3, step=0.05)
     contrast = st.slider("Contrast", 0.5, 3.0, 1.8, step=0.05)
 
-    st.header("❄️ Spikes")
-    spike_length = st.slider("Spike length (px)", 0.0, 200.0, 40.0, step=1.0)
-    spike_decay = st.slider("Spike decay (0.01–0.99)", 0.01, 0.99, 0.85, step=0.02)
-    spike_strength = st.slider("Spike strength", 0.0, 8.0, 2.5, step=0.1)
-    spike_randomness = st.slider("Spike randomness", 0.0, 1.0, 0.6, step=0.05)
-    spike_thickness = st.slider("Spike thickness", 0.0, 20.0, 4.0, step=0.5)
+    st.header("🌵 Thorny Spikes")
+    spike_length = st.slider("Spike length (px)", 0.0, 250.0, 120.0, step=5.0)
+    spike_decay = st.slider("Spike decay (0.01–0.99)", 0.01, 0.99, 0.9, step=0.02)
+    spike_strength = st.slider("Spike strength", 0.0, 8.0, 3.0, step=0.1)
+    spike_randomness = st.slider("Spike randomness", 0.0, 1.0, 0.8, step=0.05)
+    spike_thickness = st.slider("Spike thickness (subtle widening)", 0.0, 10.0, 2.0, step=0.5)
 
     st.header("🧪 Chaos")
     warp_amount = st.slider("Warp amount", 0.0, 1.0, 0.35, step=0.05)
@@ -707,7 +709,6 @@ else:
         cv2_img,
         low_thresh=low_thresh,
         high_thresh=high_thresh,
-        thickness=thickness,
         pre_blur_sigma=pre_blur_sigma,
         min_edge_area=min_edge_area,
         metal_depth=metal_depth,
@@ -742,7 +743,7 @@ else:
     # Alpha field from edges + spikes + brightness
     gray = cv2.cvtColor(artwork_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
     edges_f = edges.astype(np.float32) / 255.0
-    alpha_f = np.clip(gray * 0.5 + edges_f * 0.7 + spikes * 0.9, 0.0, 1.0)
+    alpha_f = np.clip(gray * 0.4 + edges_f * 0.9 + spikes * 1.1, 0.0, 1.0)
     alpha_f = cv2.GaussianBlur(alpha_f, (0, 0), 1.5)
     alpha_f = np.clip(alpha_f * 2.5, 0.0, 1.0)
 
