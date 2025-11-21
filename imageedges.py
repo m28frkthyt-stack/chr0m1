@@ -114,37 +114,56 @@ def extract_edges_thin(
 
 
 # ───────────────────────────────────────────────────────────────
-# Thorny spikes (long, random, protruding, controllable density)
+# Thorny spikes (long, random, sparse seeds → separated rays)
 # ───────────────────────────────────────────────────────────────
 def crystal_spike_field_thorny(
     edges_f: np.ndarray,
     spike_length: float,
-    decay: float,
+    decay_unused: float,     # kept for signature compatibility, ignored
     randomness: float,
     source_density: float,
     seed: int
 ) -> np.ndarray:
     """
-    Thorny spikes via directional shifting with randomness.
+    Thorny spikes via directional shifting, from a sparse set of seed points.
     edges_f: float 0–1, thin edges map.
 
-    source_density controls how many edge pixels can spawn spikes (0–1).
-    Lower = fewer, more isolated thorns.
+    - source_density: controls how many seeds along edges (0–1).
+      Lower = fewer, more isolated thorns.
+    - spike_length: how far rays extend.
+    - randomness: adds jitter and more directions.
+
+    This version:
+    - Samples explicit seed points from edges (image-size aware).
+    - Casts long rays with constant strength, then shapes into thorns.
     """
     if spike_length <= 0 or source_density <= 0:
         return np.zeros_like(edges_f, dtype=np.float32)
 
     h, w = edges_f.shape
-    L = max(5, int(spike_length))  # enforce at least some length
-    decay = float(np.clip(decay, 0.01, 0.99))
-    randomness = float(np.clip(randomness, 0.0, 1.0))
-    source_density = float(np.clip(source_density, 0.01, 1.0))
-
     rng = np.random.default_rng(seed)
 
-    # Randomly drop many edge pixels so not every point spawns spikes
-    spawn_mask = (rng.random((h, w)) < source_density).astype(np.float32)
-    edges_spawn = edges_f * spawn_mask
+    # ── 1) Pick sparse seed pixels along edges ─────────────────
+    edges_bin = (edges_f > 0.1).astype(np.uint8)
+    coords = np.argwhere(edges_bin > 0)
+    if coords.size == 0:
+        return np.zeros_like(edges_f, dtype=np.float32)
+
+    total_area = float(h * w)
+    # target seeds per megapixel, scaled by source_density
+    #  e.g. 10–350 per MP
+    scale = total_area / 1_000_000.0
+    base_n = int((10 + 340 * source_density) * max(scale, 0.2))
+    base_n = max(3, min(base_n, len(coords)))
+
+    idx = rng.choice(len(coords), size=base_n, replace=False)
+    seeds = np.zeros_like(edges_f, dtype=np.float32)
+    for (y, x) in coords[idx]:
+        seeds[y, x] = 1.0
+
+    # ── 2) Cast rays from seeds in many directions ─────────────
+    L = max(5, int(spike_length))  # enforce at least some length
+    randomness = float(np.clip(randomness, 0.0, 1.0))
 
     # Base cardinal + diagonal directions
     base_dirs = [
@@ -173,7 +192,7 @@ def crystal_spike_field_thorny(
             sx = step * dx
             sy = step * dy
 
-            # Jitter the path a bit to avoid perfect straight beams
+            # Jitter to break perfect straight lines
             if randomness > 0:
                 jitter_amp = 4
                 jx = rng.integers(-jitter_amp, jitter_amp + 1)
@@ -181,22 +200,25 @@ def crystal_spike_field_thorny(
                 sx += int(jx * randomness)
                 sy += int(jy * randomness)
 
-            shifted = np.roll(edges_spawn, shift=sy, axis=0)
+            shifted = np.roll(seeds, shift=sy, axis=0)
             shifted = np.roll(shifted, shift=sx, axis=1)
 
-            weight = decay ** step
-            acc = np.maximum(acc, shifted * weight)
+            # constant weight (no distance decay → strong rays all along)
+            acc = np.maximum(acc, shifted)
         spike = np.maximum(spike, acc)
 
-    # Normalize
+    # ── 3) Shape + smooth → thorny rays, not blobs ─────────────
+    # First smooth a bit to connect, then normalize
+    spike = cv2.GaussianBlur(spike, (0, 0), 1.0)
     max_val = spike.max()
     if max_val > 1e-6:
         spike = spike / max_val
 
-    # Shape into thorns: stronger shaping → less filling, more rays
-    spike = np.power(spike, 2.0)       # emphasize strong rays
-    spike[spike < 0.35] = 0.0          # cut weak haze more aggressively
-    spike = cv2.GaussianBlur(spike, (0, 0), 0.6)
+    # Emphasize rays and cut weak haze
+    spike = np.power(spike, 1.2)
+    spike[spike < 0.45] = 0.0
+    spike = cv2.GaussianBlur(spike, (0, 0), 0.7)
+
     return np.clip(spike, 0.0, 1.0)
 
 
@@ -258,11 +280,11 @@ def chrome_shading_from_edges(
 
     spec = np.power(np.clip(diffuse, 0.0, 1.0), shininess) * specular_strength
 
-    # Thorny spikes from thin edges, with density control
+    # Thorny spikes from sparse seeds along thin edges
     spikes = crystal_spike_field_thorny(
         edges_f,
         spike_length=spike_length,
-        decay=spike_decay,
+        decay_unused=spike_decay,
         randomness=spike_randomness,
         source_density=spike_source_density,
         seed=seed + 123
@@ -281,8 +303,8 @@ def chrome_shading_from_edges(
     spikes_scaled = spikes * spike_strength
 
     # ── Combine lighting & auto-pop ────────────────────────────
-    ambient = 0.12          # more base light
-    kd = 1.0                # stronger diffuse
+    ambient = 0.12          # base light
+    kd = 1.0                # diffuse factor
     intensity = ambient + kd * diffuse + spec + spikes_scaled
     intensity = np.clip(intensity, 0.0, 1.0)
 
@@ -660,11 +682,11 @@ with st.sidebar:
     contrast = st.slider("Contrast", 0.5, 3.0, 1.8, step=0.05)
 
     st.header("🌵 Thorny Spikes")
-    spike_length = st.slider("Spike length (px)", 0.0, 250.0, 120.0, step=5.0)
-    spike_decay = st.slider("Spike decay (0.01–0.99)", 0.01, 0.99, 0.9, step=0.02)
+    spike_length = st.slider("Spike length (px)", 0.0, 300.0, 160.0, step=5.0)
+    spike_decay = st.slider("Spike decay (legacy, minor effect)", 0.01, 0.99, 0.9, step=0.02)
     spike_strength = st.slider("Spike strength", 0.0, 8.0, 3.0, step=0.1)
     spike_randomness = st.slider("Spike randomness", 0.0, 1.0, 0.8, step=0.05)
-    spike_source_density = st.slider("Spike source density", 0.0, 1.0, 0.4, step=0.05)
+    spike_source_density = st.slider("Spike source density (how many seeds)", 0.0, 1.0, 0.35, step=0.05)
     spike_thickness = st.slider("Spike thickness (subtle widening)", 0.0, 10.0, 2.0, step=0.5)
 
     st.header("🧪 Chaos")
