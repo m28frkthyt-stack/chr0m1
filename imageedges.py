@@ -114,30 +114,37 @@ def extract_edges_thin(
 
 
 # ───────────────────────────────────────────────────────────────
-# Thorny spikes (long, random, protruding)
+# Thorny spikes (long, random, protruding, controllable density)
 # ───────────────────────────────────────────────────────────────
 def crystal_spike_field_thorny(
     edges_f: np.ndarray,
     spike_length: float,
     decay: float,
     randomness: float,
+    source_density: float,
     seed: int
 ) -> np.ndarray:
     """
     Thorny spikes via directional shifting with randomness.
     edges_f: float 0–1, thin edges map.
 
-    Compared to previous version, this one:
-    - favors longer rays
-    - shapes them via power + threshold to look like thorns
+    source_density controls how many edge pixels can spawn spikes (0–1).
+    Lower = fewer, more isolated thorns.
     """
-    if spike_length <= 0:
+    if spike_length <= 0 or source_density <= 0:
         return np.zeros_like(edges_f, dtype=np.float32)
 
     h, w = edges_f.shape
     L = max(5, int(spike_length))  # enforce at least some length
     decay = float(np.clip(decay, 0.01, 0.99))
     randomness = float(np.clip(randomness, 0.0, 1.0))
+    source_density = float(np.clip(source_density, 0.01, 1.0))
+
+    rng = np.random.default_rng(seed)
+
+    # Randomly drop many edge pixels so not every point spawns spikes
+    spawn_mask = (rng.random((h, w)) < source_density).astype(np.float32)
+    edges_spawn = edges_f * spawn_mask
 
     # Base cardinal + diagonal directions
     base_dirs = [
@@ -145,9 +152,7 @@ def crystal_spike_field_thorny(
         (1, 1), (-1, -1), (1, -1), (-1, 1),
     ]
 
-    rng = np.random.default_rng(seed)
-
-    # Many extra random ray directions → more bramble-ish
+    # Extra random ray directions → more bramble-ish
     max_extra_dirs = 48
     extra_count = int(round(randomness * max_extra_dirs))
     extra_dirs = []
@@ -176,7 +181,7 @@ def crystal_spike_field_thorny(
                 sx += int(jx * randomness)
                 sy += int(jy * randomness)
 
-            shifted = np.roll(edges_f, shift=sy, axis=0)
+            shifted = np.roll(edges_spawn, shift=sy, axis=0)
             shifted = np.roll(shifted, shift=sx, axis=1)
 
             weight = decay ** step
@@ -188,9 +193,9 @@ def crystal_spike_field_thorny(
     if max_val > 1e-6:
         spike = spike / max_val
 
-    # Shape into thorns: enhance bright ridges, kill low noise
-    spike = np.power(spike, 1.5)       # emphasize strong rays
-    spike[spike < 0.25] = 0.0          # cut weak haze
+    # Shape into thorns: stronger shaping → less filling, more rays
+    spike = np.power(spike, 2.0)       # emphasize strong rays
+    spike[spike < 0.35] = 0.0          # cut weak haze more aggressively
     spike = cv2.GaussianBlur(spike, (0, 0), 0.6)
     return np.clip(spike, 0.0, 1.0)
 
@@ -214,6 +219,7 @@ def chrome_shading_from_edges(
     spike_decay: float,
     spike_strength: float,
     spike_randomness: float,
+    spike_source_density: float,
     spike_thickness: float,
     seed: int
 ) -> (np.ndarray, np.ndarray):
@@ -252,12 +258,13 @@ def chrome_shading_from_edges(
 
     spec = np.power(np.clip(diffuse, 0.0, 1.0), shininess) * specular_strength
 
-    # Thorny spikes from thin edges
+    # Thorny spikes from thin edges, with density control
     spikes = crystal_spike_field_thorny(
         edges_f,
         spike_length=spike_length,
         decay=spike_decay,
         randomness=spike_randomness,
+        source_density=spike_source_density,
         seed=seed + 123
     )
 
@@ -554,6 +561,7 @@ def process_image(
     spike_decay: float,
     spike_strength: float,
     spike_randomness: float,
+    spike_source_density: float,
     spike_thickness: float,
     warp_amount: float,
     kaleido_strength: float,
@@ -594,6 +602,7 @@ def process_image(
         spike_decay=spike_decay,
         spike_strength=spike_strength,
         spike_randomness=spike_randomness,
+        spike_source_density=spike_source_density,
         spike_thickness=spike_thickness,
         seed=seed
     )
@@ -655,6 +664,7 @@ with st.sidebar:
     spike_decay = st.slider("Spike decay (0.01–0.99)", 0.01, 0.99, 0.9, step=0.02)
     spike_strength = st.slider("Spike strength", 0.0, 8.0, 3.0, step=0.1)
     spike_randomness = st.slider("Spike randomness", 0.0, 1.0, 0.8, step=0.05)
+    spike_source_density = st.slider("Spike source density", 0.0, 1.0, 0.4, step=0.05)
     spike_thickness = st.slider("Spike thickness (subtle widening)", 0.0, 10.0, 2.0, step=0.5)
 
     st.header("🧪 Chaos")
@@ -681,6 +691,9 @@ with st.sidebar:
             "Background filter",
             ["None", "Black & white", "Soft desaturate", "Blurred"]
         )
+
+    # Overall effect opacity on top of background
+    effect_opacity = st.slider("Overall effect opacity", 0.0, 1.0, 1.0, step=0.05)
 
     st.header("🧨 Glitch & Seed")
     glitch_intensity = st.slider("Glitchiness", 0.0, 1.0, 0.25, step=0.05)
@@ -725,6 +738,7 @@ else:
         spike_decay=spike_decay,
         spike_strength=spike_strength,
         spike_randomness=spike_randomness,
+        spike_source_density=spike_source_density,
         spike_thickness=spike_thickness,
         warp_amount=warp_amount,
         kaleido_strength=kaleido_strength,
@@ -746,6 +760,9 @@ else:
     alpha_f = np.clip(gray * 0.4 + edges_f * 0.9 + spikes * 1.1, 0.0, 1.0)
     alpha_f = cv2.GaussianBlur(alpha_f, (0, 0), 1.5)
     alpha_f = np.clip(alpha_f * 2.5, 0.0, 1.0)
+
+    # Apply overall effect opacity
+    alpha_f = np.clip(alpha_f * effect_opacity, 0.0, 1.0)
 
     if bg_mode == "Transparent PNG":
         rgb_float = artwork_rgb.astype(np.float32) / 255.0
