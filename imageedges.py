@@ -463,12 +463,17 @@ def add_grain(img: np.ndarray, amount: float, seed: int) -> np.ndarray:
 
     h, w = img.shape[:2]
     rng = np.random.default_rng(seed)
-    noise = rng.normal(0, 1, (h, w, 1)).astype(np.float32)
+
+    # Generate single-channel noise, blur it, then ensure shape (H,W,1)
+    noise = rng.normal(0, 1, (h, w)).astype(np.float32)
     noise = cv2.GaussianBlur(noise, (0, 0), 1.0)
+    if noise.ndim == 2:
+        noise = noise[..., None]  # (H,W) → (H,W,1)
+
     noise = noise / (np.max(np.abs(noise)) + 1e-6)
 
     scale = 40 * amount
-    noisy = img.astype(np.float32) + noise * scale
+    noisy = img.astype(np.float32) + noise * scale  # (H,W,1) broadcasts over (H,W,3)
     return np.clip(noisy, 0, 255).astype(np.uint8)
 
 
